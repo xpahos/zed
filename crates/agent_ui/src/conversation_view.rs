@@ -1598,11 +1598,27 @@ impl ConversationView {
             let thread = thread.downgrade();
             move |index, cx| {
                 thread.upgrade().is_none_or(|thread| {
+                    let thread = thread.read(cx);
+                    if let Some(entry) = thread.entries().get(index) {
+                        return !entry.has_pending_markdown_render(cx);
+                    }
+                    if index != thread.entries().len()
+                        || !AgentSettings::get_global(cx).show_plan_in_conversation
+                    {
+                        return true;
+                    }
                     thread
-                        .read(cx)
-                        .entries()
-                        .get(index)
-                        .is_none_or(|entry| !entry.has_pending_markdown_render(cx))
+                        .plan()
+                        .filter(|plan| !plan.is_empty(cx))
+                        .is_none_or(|plan| match &plan.content {
+                            acp_thread::PlanContent::Items(entries) => entries
+                                .iter()
+                                .all(|entry| !entry.content.read(cx).has_pending_render()),
+                            acp_thread::PlanContent::Markdown(markdown) => {
+                                !markdown.read(cx).has_pending_render()
+                            }
+                            acp_thread::PlanContent::File { .. } => true,
+                        })
                 })
             }
         });
@@ -9856,6 +9872,368 @@ pub(crate) mod tests {
         });
     }
 
+    fn plan_card_update(
+        plan_id: &str,
+        entries: &[(impl AsRef<str>, &str)],
+    ) -> acp_v1::SessionUpdate {
+        let entries = entries
+            .iter()
+            .map(|(content, status)| json!({"content": content.as_ref(), "priority": "medium", "status": status}))
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({
+            "sessionUpdate": "plan_update",
+            "plan": {"type": "items", "planId": plan_id, "entries": entries},
+        }))
+        .expect("plan update")
+    }
+
+    fn send_plan_card_update(
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        update: acp_v1::SessionUpdate,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+        cx.run_until_parked();
+    }
+
+    fn click_clear_plan(cx: &mut VisualTestContext) {
+        let card = cx.debug_bounds("active-plan-card").expect("visible card");
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let dismiss = cx
+            .debug_bounds("dismiss-plan-card")
+            .expect("Clear Plan control");
+        cx.simulate_click(dismiss.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    fn set_show_plan_in_conversation(enabled: bool, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(
+                        &json!({"agent": {"show_plan_in_conversation": enabled}}).to_string(),
+                        cx,
+                    )
+                    .expect("valid plan presentation setting");
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_plan_presentation_follows_setting(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let assert_presentation =
+            |in_conversation: bool, has_plan: bool, cx: &mut VisualTestContext| {
+                assert_eq!(
+                    cx.debug_bounds("plan_summary").is_some(),
+                    has_plan && !in_conversation
+                );
+                assert_eq!(
+                    cx.debug_bounds("active-plan-card").is_some(),
+                    has_plan && in_conversation
+                );
+                thread_view.read_with(cx, assert_thread_list_item_count_matches_entries);
+            };
+        for enabled in [false, true] {
+            set_show_plan_in_conversation(enabled, cx);
+            assert_presentation(enabled, false, cx);
+        }
+        send_plan_card_update(
+            &connection,
+            &session_id,
+            plan_card_update("a", &[("Original step", "in_progress")]),
+            cx,
+        );
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("draft", window, cx);
+        });
+        for enabled in [false, true, false, true] {
+            set_show_plan_in_conversation(enabled, cx);
+            assert_presentation(enabled, true, cx);
+        }
+        thread.read_with(cx, |thread, cx| {
+            let entry = thread
+                .plan()
+                .expect("selected plan")
+                .entries()
+                .first()
+                .expect("plan item");
+            assert_eq!(entry.content.read(cx).source().as_ref(), "Original step");
+            assert!(
+                thread.entries().is_empty(),
+                "the plan stays outside the transcript"
+            );
+        });
+        assert_eq!(
+            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            "draft"
+        );
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["queued".into()], vec![], window, cx);
+        });
+        cx.run_until_parked();
+        thread_view.update_in(cx, |view, window, cx| {
+            assert!(view.render_activity_bar(window, cx).is_some());
+        });
+        cx.dispatch_action(ClearMessageQueue);
+        cx.run_until_parked();
+        thread_view.update_in(cx, |view, window, cx| {
+            assert!(view.render_activity_bar(window, cx).is_none());
+        });
+
+        click_clear_plan(cx);
+        assert_presentation(true, false, cx);
+        set_show_plan_in_conversation(false, cx);
+        assert_presentation(false, false, cx);
+        thread.read_with(cx, |thread, _| assert!(thread.plan().is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_clearing_a_file_plan_card_does_not_open_the_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        set_show_plan_in_conversation(true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update(cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                thread.upsert_plan_file(
+                    acp_v2::PlanFile::new("file", "https://example.com/plan.md"),
+                    None,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        click_clear_plan(cx);
+        assert!(cx.debug_bounds("active-plan-card").is_none());
+        assert_eq!(cx.opened_url(), None, "clearing does not open the file");
+
+        // The rest of the card still opens the file.
+        thread_view.update(cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                thread.upsert_plan_file(
+                    acp_v2::PlanFile::new("file", "https://example.com/revised.md"),
+                    None,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        let card = cx.debug_bounds("active-plan-card").expect("reopened card");
+        cx.simulate_click(card.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com/revised.md")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plan_card_does_not_move_a_scrolled_up_conversation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        set_show_plan_in_conversation(true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let send = |update, cx: &mut VisualTestContext| {
+            send_plan_card_update(&connection, &session_id, update, cx)
+        };
+        let output = || {
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Agent output\n\n".repeat(200).into(),
+            ))
+        };
+        send(output(), cx);
+        send(plan_card_update("a", &[("Short step", "pending")]), cx);
+        let list = thread_view.read_with(cx, |view, _| view.list_state.clone());
+        assert!(list.is_following_tail());
+        let short_height = cx
+            .debug_bounds("active-plan-card")
+            .expect("card")
+            .size
+            .height;
+        send(
+            plan_card_update(
+                "a",
+                &[("First line\n\nSecond line\n\nThird line", "pending")],
+            ),
+            cx,
+        );
+        assert!(
+            cx.debug_bounds("active-plan-card")
+                .expect("taller card")
+                .size
+                .height
+                > short_height
+        );
+        assert!(list.is_following_tail());
+        thread_view.update(cx, |view, cx| view.scroll_to_top(cx));
+        cx.run_until_parked();
+        let scrolled_up = list.logical_scroll_top();
+        assert!(!list.is_following_tail());
+        let entries = (0..12)
+            .map(|index| (format!("Step {index}"), "pending"))
+            .collect::<Vec<_>>();
+        send(plan_card_update("a", &entries), cx);
+        send(output(), cx);
+        for enabled in [false, true] {
+            set_show_plan_in_conversation(enabled, cx);
+            assert_eq!(list.logical_scroll_top(), scrolled_up);
+            assert!(!list.is_following_tail());
+            thread_view.read_with(cx, assert_thread_list_item_count_matches_entries);
+        }
+
+        thread_view.update(cx, |view, cx| view.scroll_to_end(cx));
+        cx.run_until_parked();
+        send(output(), cx);
+        assert!(list.is_following_tail());
+        assert!(cx.debug_bounds("plan-entry-11-Pending").is_some());
+        thread_view.read_with(cx, assert_thread_list_item_count_matches_entries);
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert!(list.is_following_tail());
+        thread_view.read_with(cx, |view, cx| {
+            assert!(!view.generating_indicator_in_list);
+            assert_thread_list_item_count_matches_entries(view, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_plan_card_row_stays_in_step_when_an_entry_arrives_with_a_plan_change(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        set_show_plan_in_conversation(true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let plan = || {
+            acp_v2::PlanItems::new(
+                "a",
+                vec![acp_v2::PlanEntry::new(
+                    "Step",
+                    acp_v2::PlanEntryPriority::Medium,
+                    acp_v2::PlanEntryStatus::Pending,
+                )],
+            )
+        };
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let list = thread_view.read_with(cx, |view, _| view.list_state.clone());
+        thread.update(cx, |thread, cx| thread.upsert_plan_items(plan(), None, cx));
+        cx.run_until_parked();
+        assert_eq!(list.item_count(), 1);
+        assert!(cx.debug_bounds("active-plan-card").is_some());
+
+        // The plan change only notifies while the entry is announced by an event, so the
+        // card's row is synced before the list has heard about the new entry.
+        thread.update(cx, |thread, cx| {
+            thread.clear_plan(cx);
+            thread.push_assistant_content_block("First".into(), false, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(list.item_count(), 1);
+        assert!(cx.debug_bounds("active-plan-card").is_none());
+
+        thread.update(cx, |thread, cx| {
+            thread.remove_plan("a".into(), cx);
+            thread.upsert_plan_items(plan(), None, cx);
+            thread.push_user_content_block(None, "Second".into(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(list.item_count(), 3);
+        assert!(cx.debug_bounds("active-plan-card").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_plan_card_preserves_scroll_during_markdown_parsing(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        set_show_plan_in_conversation(true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update(cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                let entries = (0..100)
+                    .map(|index| {
+                        acp_v2::PlanEntry::new(
+                            format!("Step {index}"),
+                            acp_v2::PlanEntryPriority::Medium,
+                            acp_v2::PlanEntryStatus::Pending,
+                        )
+                    })
+                    .collect();
+                thread.upsert_plan_items(acp_v2::PlanItems::new("probe", entries), None, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.draw(
+                point(px(0.0), px(0.0)),
+                size(px(800.0), px(600.0)),
+                |_, _| thread_view.clone().into_any_element(),
+            );
+        };
+        draw(cx);
+        let list = thread_view.read_with(cx, |view, _| view.list_state.clone());
+        let expected = ListOffset {
+            item_ix: 0,
+            offset_in_item: px(800.0),
+        };
+        list.scroll_to(expected);
+        draw(cx);
+        assert_eq!(list.logical_scroll_top(), expected);
+
+        let text = (0..100)
+            .map(|index| format!("Paragraph {index}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        thread_view.update(cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                thread.upsert_plan_markdown(acp_v2::PlanMarkdown::new("probe", text), None, cx);
+                let plan = thread.plan().expect("visible plan");
+                let acp_thread::PlanContent::Markdown(markdown) = &plan.content else {
+                    panic!("expected a Markdown plan");
+                };
+                assert!(markdown.read(cx).is_parsing());
+            });
+        });
+        draw(cx);
+        assert_eq!(list.logical_scroll_top(), expected, "pending parse");
+        cx.run_until_parked();
+        draw(cx);
+        assert_eq!(list.logical_scroll_top(), expected, "completed parse");
+        assert!(!list.is_following_tail());
+    }
+
     async fn setup_conversation_view_with_initial_content(
         agent: impl AgentServer + 'static,
         initial_content: AgentInitialContent,
@@ -10933,7 +11311,9 @@ pub(crate) mod tests {
     fn assert_thread_list_item_count_matches_entries(view: &ThreadView, cx: &App) {
         assert_eq!(
             view.list_state.item_count(),
-            view.thread.read(cx).entries().len() + usize::from(view.generating_indicator_in_list)
+            view.thread.read(cx).entries().len()
+                + usize::from(view.plan_card_in_list)
+                + usize::from(view.generating_indicator_in_list)
         );
     }
 

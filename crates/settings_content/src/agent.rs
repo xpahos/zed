@@ -361,6 +361,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// Display the current agent plan as a card in the conversation instead of the panel above the message editor.
+    ///
+    /// Default: false
+    pub show_plan_in_conversation: Option<bool>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).

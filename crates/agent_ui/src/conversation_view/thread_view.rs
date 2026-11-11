@@ -804,6 +804,10 @@ pub struct ThreadView {
     sandbox_status_key: Option<SandboxStatusKey>,
     pending_sandbox_status_key: Option<SandboxStatusKey>,
     pub multi_root_callout_dismissed: bool,
+    /// Whether the list has a row for the selected plan's card, directly after the entries.
+    pub plan_card_in_list: bool,
+    /// See [`plan_card_hash`].
+    plan_card_hash: Option<u64>,
     pub generating_indicator_in_list: bool,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
@@ -1043,7 +1047,16 @@ impl ThreadView {
         let session_id = thread.read(cx).session_id().clone();
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
-        subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&thread, |this, _, cx| {
+            this.plan_card_updated(cx);
+            cx.notify();
+        }));
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            if this.should_show_plan_card(cx) != this.plan_card_in_list {
+                this.plan_card_updated(cx);
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
             if matches!(
@@ -1331,6 +1344,8 @@ impl ThreadView {
             sandbox_status_key: None,
             pending_sandbox_status_key: None,
             multi_root_callout_dismissed: false,
+            plan_card_in_list: false,
+            plan_card_hash: None,
             generating_indicator_in_list: false,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
@@ -1339,6 +1354,7 @@ impl ThreadView {
         };
 
         this.sync_reported_activity(cx);
+        this.sync_plan_card(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
@@ -1528,6 +1544,7 @@ impl ThreadView {
 
     fn has_visible_conversation(&self, cx: &App) -> bool {
         self.generating_indicator_in_list
+            || self.plan_card_in_list
             || self.thread.read(cx).entries().iter().any(|entry| {
                 !matches!(entry, AgentThreadEntry::UserMessage(message)
                     if message.content.source_blocks().is_empty())
@@ -4006,7 +4023,9 @@ impl ThreadView {
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
-        let plan = thread.plan().filter(|plan| !plan.is_empty(cx));
+        let plan = thread.plan().filter(|plan| {
+            !AgentSettings::get_global(cx).show_plan_in_conversation && !plan.is_empty(cx)
+        });
         let has_plan = plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
 
@@ -4869,45 +4888,8 @@ impl ThreadView {
 
         let title = match &plan.content {
             PlanContent::Items(_) => self.render_plan_items_title(plan, window, cx),
-            PlanContent::Markdown(markdown) => {
-                let heading = markdown_plan_heading(markdown.read(cx).source());
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        Label::new("Plan")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .when_some(heading, |this, heading| {
-                        this.child(
-                            Label::new(heading.to_owned())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        )
-                    })
-            }
-            PlanContent::File { uri } => h_flex()
-                .w_full()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    Label::new("Plan")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(plan_file_label(uri))
-                        .size(LabelSize::Small)
-                        .truncate(),
-                )
-                .child(
-                    Icon::new(IconName::ArrowUpRight)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                ),
+            PlanContent::Markdown(markdown) => plan_markdown_title(markdown, cx),
+            PlanContent::File { uri } => plan_file_title(uri),
         };
 
         h_flex()
@@ -4923,16 +4905,7 @@ impl ThreadView {
                 this.child(Disclosure::new("plan_disclosure", plan_expanded))
             })
             .child(title.flex_1())
-            .child(
-                IconButton::new("dismiss-plan", IconName::Close)
-                    .icon_size(IconSize::XSmall)
-                    .shape(ui::IconButtonShape::Square)
-                    .tooltip(Tooltip::text("Clear Plan"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.thread.update(cx, |thread, cx| thread.clear_plan(cx));
-                        cx.stop_propagation();
-                    })),
-            )
+            .child(self.render_clear_plan_button("dismiss-plan", cx))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(uri) = &file_uri {
                     open_link(uri.clone(), &this.workspace, window, cx);
@@ -5027,18 +5000,9 @@ impl ThreadView {
                     .into_any_element(),
             ),
             PlanContent::Markdown(markdown) => Some(
-                v_flex()
-                    .id("plan_markdown")
+                self.render_plan_markdown(markdown, window, cx)
                     .max_h_64()
                     .overflow_y_scroll()
-                    .px_2()
-                    .py_1()
-                    .bg(cx.theme().colors().editor_background)
-                    .text_xs()
-                    .child(MarkdownElement::new(
-                        markdown.clone(),
-                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                    ))
                     .into_any_element(),
             ),
             PlanContent::File { .. } => None,
@@ -5117,6 +5081,178 @@ impl ThreadView {
                 })),
             )
             .into_any_element()
+    }
+
+    fn render_clear_plan_button(&self, id: &'static str, cx: &Context<Self>) -> IconButton {
+        IconButton::new(id, IconName::Close)
+            .icon_size(IconSize::XSmall)
+            .shape(ui::IconButtonShape::Square)
+            .tooltip(Tooltip::text("Clear Plan"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.thread.update(cx, |thread, cx| thread.clear_plan(cx));
+                cx.stop_propagation();
+            }))
+    }
+
+    fn render_plan_markdown(
+        &self,
+        markdown: &Entity<Markdown>,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        v_flex()
+            .id("plan_markdown")
+            .px_2()
+            .py_1()
+            .bg(cx.theme().colors().editor_background)
+            .text_xs()
+            .child(MarkdownElement::new(
+                markdown.clone(),
+                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+            ))
+    }
+
+    fn render_plan_card(&self, plan: &Plan, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let border_color = cx.theme().colors().border_variant;
+        let card = v_flex()
+            .debug_selector(|| "active-plan-card".into())
+            .group("active-plan-card")
+            .relative()
+            .w_full()
+            .overflow_hidden()
+            .border_1()
+            .border_color(border_color)
+            .rounded_xl();
+        let header = |title: Div| {
+            title
+                .py_1()
+                .pl_2()
+                .pr_8()
+                .min_h_7()
+                .bg(self.tool_card_header_bg(cx))
+        };
+
+        let card = match &plan.content {
+            PlanContent::Items(entries) => {
+                card.child(self.render_plan_card_entries(entries, window, cx))
+            }
+            PlanContent::Markdown(markdown) => card
+                .child(
+                    header(plan_markdown_title(markdown, cx))
+                        .border_b_1()
+                        .border_color(border_color),
+                )
+                .child(self.render_plan_markdown(markdown, window, cx)),
+            PlanContent::File { uri } => card.child(
+                header(plan_file_title(uri))
+                    .id("plan_file")
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let uri = uri.clone();
+                        move |this, _, window, cx| {
+                            open_link(uri.clone(), &this.workspace, window, cx);
+                        }
+                    })),
+            ),
+        };
+
+        // Absolutely positioned so that revealing it on hover cannot change the card's height.
+        let card = card.child(
+            div()
+                .absolute()
+                .top_1()
+                .right_1()
+                .visible_on_hover("active-plan-card")
+                .debug_selector(|| "dismiss-plan-card".into())
+                .child(self.render_clear_plan_button("dismiss-plan-card", cx)),
+        );
+
+        div()
+            .px_5()
+            .py_1p5()
+            .w_full()
+            .child(card)
+            .into_any_element()
+    }
+
+    fn render_plan_card_entries(
+        &self,
+        entries: &[acp_thread::PlanEntry],
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        // The stroked status glyphs fill 10/16 of their icon box, so the box is
+        // oversized to make their visible diameter match the completed disc.
+        let disc_size = IconSize::Small.rems();
+        let stroked_icon_size = IconSize::Custom(rems_from_px(22_f32));
+        let base_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let line_height = base_style
+            .base_text_style
+            .line_height_in_pixels(window.rem_size());
+        v_flex()
+            .w_full()
+            .text_ui(cx)
+            .pl_4()
+            .pr_8()
+            .py_3p5()
+            .gap_1p5()
+            .children(entries.iter().enumerate().map(|(index, entry)| {
+                let status = &entry.source.status;
+                let mut style = base_style.clone();
+                style.base_text_style.color = match status {
+                    acp_v2::PlanEntryStatus::Completed | acp_v2::PlanEntryStatus::Cancelled => {
+                        colors.text_muted
+                    }
+                    _ => colors.text,
+                };
+                let icon = match status {
+                    acp_v2::PlanEntryStatus::Completed => h_flex()
+                        .size(disc_size)
+                        .justify_center()
+                        .rounded_full()
+                        .bg(colors.icon_muted)
+                        .child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Custom(colors.panel_background)),
+                        )
+                        .into_any_element(),
+                    acp_v2::PlanEntryStatus::InProgress => Icon::new(IconName::LoadCircle)
+                        .size(stroked_icon_size)
+                        .color(Color::Custom(colors.icon_muted.opacity(0.6)))
+                        .with_rotate_animation(2)
+                        .into_any_element(),
+                    acp_v2::PlanEntryStatus::Cancelled => Icon::new(IconName::Close)
+                        .size(stroked_icon_size)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                    _ => Icon::new(IconName::TodoPending)
+                        .size(stroked_icon_size)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                };
+
+                h_flex()
+                    .debug_selector(|| format!("plan-entry-{index}-{status:?}"))
+                    .w_full()
+                    .items_start()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .h(line_height)
+                            .w(disc_size)
+                            .justify_center()
+                            .child(icon),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(MarkdownElement::new(entry.content.clone(), style)),
+                    )
+            }))
     }
 
     fn render_context_compaction(
@@ -7423,13 +7559,23 @@ impl ThreadView {
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
-                } else if this.generating_indicator_in_list {
-                    let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
-                        || this.has_pending_request_elicitation(cx);
-                    let rendered = this.render_generating(confirmation, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
                 } else {
-                    Empty.into_any()
+                    match this.tail_row(index - entries.len()) {
+                        Some(TailRow::PlanCard) => {
+                            let Some(plan) = this.thread.read(cx).plan() else {
+                                return Empty.into_any();
+                            };
+                            let rendered = this.render_plan_card(plan, window, cx);
+                            centered_container(rendered).into_any_element()
+                        }
+                        Some(TailRow::GeneratingIndicator) => {
+                            let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
+                                || this.has_pending_request_elicitation(cx);
+                            let rendered = this.render_generating(confirmation, cx);
+                            centered_container(rendered.into_any_element()).into_any_element()
+                        }
+                        None => Empty.into_any(),
+                    }
                 }
             }),
         )
@@ -8647,15 +8793,77 @@ impl ThreadView {
         let is_generating =
             matches!(thread.status(), ThreadStatus::Generating) && !thread.is_compacting();
 
+        let item_count = self.list_state.item_count();
         if is_generating && !self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
-            self.list_state.splice(entries_count..entries_count, 1);
+            self.list_state.splice(item_count..item_count, 1);
             self.generating_indicator_in_list = true;
         } else if !is_generating && self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
-            self.list_state.splice(entries_count..entries_count + 1, 0);
+            self.list_state
+                .splice(item_count.saturating_sub(1)..item_count, 0);
             self.generating_indicator_in_list = false;
         }
+    }
+
+    /// Where the plan card's row is, or would go: after the entries and before the generating
+    /// indicator. Counted from the list rather than the thread's entries, because a plan
+    /// change is observed before the list has spliced in an entry added in the same update.
+    fn plan_card_index(&self) -> usize {
+        self.list_state
+            .item_count()
+            .saturating_sub(usize::from(self.generating_indicator_in_list))
+            .saturating_sub(usize::from(self.plan_card_in_list))
+    }
+
+    fn tail_row(&self, offset: usize) -> Option<TailRow> {
+        [
+            self.plan_card_in_list.then_some(TailRow::PlanCard),
+            self.generating_indicator_in_list
+                .then_some(TailRow::GeneratingIndicator),
+        ]
+        .into_iter()
+        .flatten()
+        .nth(offset)
+    }
+
+    fn should_show_plan_card(&self, cx: &App) -> bool {
+        AgentSettings::get_global(cx).show_plan_in_conversation
+            && self
+                .thread
+                .read(cx)
+                .plan()
+                .is_some_and(|plan| !plan.is_empty(cx))
+    }
+
+    /// Ensures the list item count includes (or excludes) an extra item for the plan card
+    fn sync_plan_card(&mut self, cx: &App) {
+        let show_plan_card = self.should_show_plan_card(cx);
+
+        let index = self.plan_card_index();
+        if show_plan_card && !self.plan_card_in_list {
+            self.list_state.splice(index..index, 1);
+            self.plan_card_in_list = true;
+        } else if !show_plan_card && self.plan_card_in_list {
+            self.list_state.splice(index..index + 1, 0);
+            self.plan_card_in_list = false;
+        }
+    }
+
+    /// The selected plan or where it is shown changed, so the card's row may need to appear,
+    /// go away, or change height.
+    fn plan_card_updated(&mut self, cx: &App) {
+        let was_in_list = self.plan_card_in_list;
+        self.sync_plan_card(cx);
+        let thread = self.thread.read(cx);
+        let hash = self
+            .plan_card_in_list
+            .then(|| thread.plan())
+            .flatten()
+            .map(|plan| plan_card_hash(plan, cx));
+        if was_in_list && self.plan_card_in_list && hash != self.plan_card_hash {
+            let index = self.plan_card_index();
+            self.list_state.remeasure_items(index..index + 1);
+        }
+        self.plan_card_hash = hash;
     }
 
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
@@ -14547,6 +14755,77 @@ pub(crate) fn open_link(
             workspace.open_url_or_file(&url, None, window, cx);
         });
     }
+}
+
+/// A list row that follows the transcript entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailRow {
+    PlanCard,
+    GeneratingIndicator,
+}
+
+fn plan_markdown_title(markdown: &Entity<Markdown>, cx: &App) -> Div {
+    let heading = markdown_plan_heading(markdown.read(cx).source());
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(
+            Label::new("Plan")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .when_some(heading, |this, heading| {
+            this.child(
+                Label::new(heading.to_owned())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+        })
+}
+
+fn plan_file_title(uri: &str) -> Div {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(
+            Label::new("Plan")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(plan_file_label(uri))
+                .size(LabelSize::Small)
+                .truncate(),
+        )
+        .child(
+            Icon::new(IconName::ArrowUpRight)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+}
+
+/// Hashes what the height of the plan card depends on. Counting the entries is not enough:
+/// their text wraps, so rewording an entry can change how many lines it takes, and a markdown
+/// plan has no entries at all. Statuses and a plan file's URI are left out because they only
+/// change icons, colors and a single truncated label.
+fn plan_card_hash(plan: &Plan, cx: &App) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = collections::FxHasher::default();
+    match &plan.content {
+        PlanContent::Items(entries) => {
+            for entry in entries {
+                entry.source.content.hash(&mut hasher);
+            }
+        }
+        PlanContent::Markdown(markdown) => markdown.read(cx).source().hash(&mut hasher),
+        PlanContent::File { .. } => {}
+    }
+    std::mem::discriminant(&plan.content).hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The first markdown heading, used as the collapsed summary of a markdown plan.

@@ -7093,6 +7093,7 @@ See [Agent Panel](#agent-panel) for width, flexible sizing, and Threads Sidebar 
 | `play_sound_when_agent_done`           | `"never"`                                       | Completion and input-required sounds: `"never"`, `"when_hidden"`, or `"always"`.                      |
 | `expand_edit_card`                     | `true`                                          | Expand new edit cards to show diffs.                                                                  |
 | `expand_terminal_card`                 | `true`                                          | Expand new terminal cards to show output.                                                             |
+| `show_plan_in_conversation`            | `false`                                         | Show the current agent plan as a card in the conversation instead of above the message editor.        |
 | `terminal_init_command`                | `""`                                            | Command run when creating or recreating a Terminal Thread shell, or an empty string to disable.       |
 | `thinking_display`                     | `"auto"`                                        | Thinking-block presentation: `"auto"`, `"preview"`, `"always_expanded"`, or `"always_collapsed"`.     |
 | `cancel_generation_on_terminal_stop`   | `true`                                          | Cancel generation when clicking the terminal tool's Stop button.                                      |

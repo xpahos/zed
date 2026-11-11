@@ -9479,6 +9479,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Plan in Conversation",
+                description: "Display the current agent plan as a card in the conversation instead of the panel above the message editor.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.show_plan_in_conversation"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .show_plan_in_conversation
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .show_plan_in_conversation = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Terminal Thread Init Command",
                 description: "Command to automatically run when Zed creates a Terminal Thread shell in the agent panel. Runs in your configured shell.",
                 field: Box::new(SettingField {
